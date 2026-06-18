@@ -1,13 +1,13 @@
 """
-Integrated 3D Simulation — 大纲四层架构 v9
+Integrated 3D Simulation — 大纲四层架构 v11
 
-修改（相对 v8）：
-1. GPR 真正作为 MPC 主预测模型
-   - MPC 的 pf() 直接调用 gpr.predict()，不再经过 ks*stretch 弹簧公式
-   - GPR ready 前用 RLS 弹簧模型作为 fallback
-   - σ 直接作为 Tube-MPC 约束收紧依据，无需 local_ks 数值微分
-2. RLS 退出主预测流程，arc 阶段加 stretch 门控防止无激励漂移
-3. v8 的其他改动保留：径向约束、arc 预热、区间中点吸引、v_prev 修复
+修改（相对 v9）：
+1. RLS 直接驱动 MPC：pf 和 pf_fast 合并为同一个弹簧模型，消除约束不一致
+2. GPR 退回 Tube-MPC 角色：只提供 σ 收紧 f_max_eff，不参与力点预测
+3. settle 阶段改为径向拉伸扫描：从 L0_est 开始推到 stretch≈0.1m 再收回
+   临床意义：治疗师接触后做完整阻力评估，给 RLS 宽范围激励
+4. f_lower 提高到 f_taut：绷直作为硬约束
+5. 去掉速度惩罚项 W_INPUT
 """
 import matplotlib
 matplotlib.use('Agg')
@@ -52,7 +52,7 @@ def true_force_3d(p, vel=0.0, acc=0.0):
 # ══════════════════════════════════════════════════════
 W_FORCE  = 30.0
 W_TIME   = 0.5
-W_INPUT  = 0.05
+W_INPUT  = 0.0   # 临床场景不需要速度约束，已移除
 W_ANGLE  = 10.0
 V_MAX    = 0.3
 V_MIN    = 0.05
@@ -60,21 +60,21 @@ V_RAMP   = 60
 MPC_N    = 6
 
 # ── 径向约束参数 ─────────────────────────────────────────
-R_TOL        = 0.04   # 允许径向偏差 ±4cm
-R_REF_UPDATE = 20     # 每隔多少步更新一次 R_ref
+R_TOL        = 0.04
+R_REF_UPDATE = 20
 
 # ── Arc 早期安全预热 ─────────────────────────────────────
-# 临床意义：刚开始牵引时先轻推，确认方向和阻力正常再正式发力
-ARC_WARMUP_STEPS = 15   # 预热步数
-V_WARMUP         = 0.02  # 预热阶段速度上限 (m/s)
+ARC_WARMUP_STEPS = 20
+V_WARMUP         = 0.02
 
 # ── Settle 阶段参数 ──────────────────────────────────────
-# 临床含义：评估性触诊，小幅径向往返激励 RLS 收敛
-SETTLE_STEPS      = 180   # settle 阶段最大步数（临床可接受：5秒@20Hz）
-SETTLE_AMP        = 0.06  # 径向往返幅度 (m)，临床场景可压缩到 0.01
-SETTLE_SPEED      = 0.08  # settle 阶段速度 (m/s)
-KS_MIN_FOR_GPR    = 25.0  # RLS ks 估计超过此值才允许 GPR 接管（真值的 50%）
-GPR_MIN_DATA      = 20    # GPR 接管所需最小数据点数
+# 临床含义：治疗师接触后做完整阻力评估，从自然长度推到最大安全 stretch 再收回
+# 给 RLS 提供宽范围激励（stretch 0→0.10m），比正弦往返收敛快
+SETTLE_STEPS      = 160   # 给 RLS 更充分的时间收敛到真值附近
+SETTLE_AMP        = 0.05  # 安全拉伸幅度：f_max_safe/ks ≈ 3/50 = 0.06m，留裕量取 0.05
+SETTLE_SPEED      = 0.06  # settle 运动速度 (m/s)
+KS_MIN_FOR_GPR    = 40.0  # RLS 收敛门槛（真值 50 的 80%）
+GPR_MIN_DATA      = 20
 
 # ══════════════════════════════════════════════════════
 # BOCD
@@ -130,7 +130,7 @@ class RLS:
         return self.theta.copy()
 
     def force_bounds(self, f_taut):
-        f_lower = 0.8 * f_taut
+        f_lower = 0.95 * f_taut                 # 接近绷直，留小余量防止约束不可行
         f_upper = min(2.5 * f_taut, f_max_safe)
         return f_lower, f_upper
 
@@ -198,8 +198,7 @@ def run_mpc_3d(p_cur, v_cur, ks_eff, b_rls, m_rls,
                anchor_est, L0_est,
                theta_cur, theta_target,
                f_taut, f_lower, f_upper,
-               sigma_gpr=0., v_max_cur=0.1, R_ref=None,
-               gpr_model=None, gpr_ready=False):
+               sigma_gpr=0., v_max_cur=0.1, R_ref=None):
 
     f_max_eff = f_upper - 2.0*np.clip(sigma_gpr, 0., 0.5)
     f_max_eff = max(f_max_eff, f_taut*1.1)
@@ -208,36 +207,25 @@ def run_mpc_3d(p_cur, v_cur, ks_eff, b_rls, m_rls,
         R_ref = np.linalg.norm(p_cur - anchor_est)
 
     def pf(p_, v_, a_):
-        """GPR ready 时直接用 GPR 预测力，否则用 RLS 弹簧模型（用于代价函数）"""
-        dist_ = np.linalg.norm(p_ - anchor_est)
-        stretch_ = max(0., dist_ - L0_est)
-        vs_ = np.linalg.norm(v_)
-        theta_ = np.arctan2(p_[1]-anchor_est[1], p_[0]-anchor_est[0])
-        if gpr_ready and gpr_model is not None:
-            mu, _ = gpr_model.predict(stretch_, vs_, theta_)
-            if mu is not None:
-                return max(0., mu)
-        return max(0., ks_eff*stretch_ + b_rls*vs_ + m_rls*np.linalg.norm(a_))
-
-    def pf_fast(p_, v_, a_):
-        """轻量弹簧模型，用于约束函数（避免约束评估时反复调用 GPR）"""
+        """统一力预测：RLS 弹簧模型
+        GPR 退回 Tube-MPC 角色，只提供 σ 收紧 f_max_eff，不参与力点预测
+        代价函数和约束函数使用同一模型，消除不一致"""
         stretch_ = max(0., np.linalg.norm(p_-anchor_est) - L0_est)
         return max(0., ks_eff*stretch_ + b_rls*np.linalg.norm(v_) + m_rls*np.linalg.norm(a_))
 
+    pf_fast = pf  # 两者完全一致
+
     def cost(u_flat):
         u_seq=u_flat.reshape(MPC_N,3); p=p_cur.copy(); v=v_cur.copy(); c=0.
-        f_mid = (f_lower + f_max_eff) / 2.0   # 区间中点
-        W_MID = 2.0                             # 轻微吸引，远小于边界惩罚
+        f_mid = 0.7*f_lower + 0.3*f_max_eff  # 偏向绷直下界，倾向在刚绷直状态工作
+        W_MID = 3.0
         for k in range(MPC_N):
             vk=u_seq[k]; ak=(vk-v)/dt; pn=p+dt*vk
             f_pred = pf(pn, vk, ak)
-            # 单边硬惩罚：越界才强惩罚
             c += W_FORCE * max(0, f_lower - f_pred) ** 2
             c += W_FORCE * max(0, f_pred - f_max_eff) ** 2
-            # 轻微中点吸引：在可行域内给优化器方向感
             c += W_MID * (f_pred - f_mid) ** 2
             c += W_TIME
-            c += W_INPUT * float(np.dot(vk, vk))
             tn=np.arctan2(pn[1]-anchor_est[1], pn[0]-anchor_est[0])
             pg=tn-theta_cur
             if pg<-np.pi: pg+=2*np.pi
@@ -403,18 +391,27 @@ for t in range(T_sim):
         hks.append(rls.theta[0]); hgmu.append(0.); hgsig.append(0.)
         h_flower.append(f_lower); h_fupper.append(f_upper); h_vmax.append(0.)
 
-    # ── 阶段 1：Settle（小幅径向往返，激励 RLS） ────────
+    # ── 阶段 1：Settle（径向拉伸扫描，激励 RLS） ────────
     elif phase==1:
         dist = np.linalg.norm(p_cur-anchor_est)
         dn   = (p_cur-anchor_est)/(dist+1e-6)
-        # 以 settle_base_dist 为中心，正弦往返（2个完整周期）
-        phase_osc = 2 * np.pi * settle_steps_done / max(SETTLE_STEPS/2, 1)
-        target_dist = settle_base_dist + SETTLE_AMP * np.sin(phase_osc)
+
+        # 力安全检查：settle 阶段力接近上限时立即收回
+        # 临床意义：评估阻力时不能对患者施加危险力度
+        if fm > f_max_safe * 0.8:
+            target_dist = settle_base_dist  # 强制收回到基准距离
+        else:
+            half = SETTLE_STEPS / 2
+            if settle_steps_done < half:
+                target_dist = settle_base_dist + SETTLE_AMP * (settle_steps_done / half)
+            else:
+                target_dist = settle_base_dist + SETTLE_AMP * (2 - settle_steps_done / half)
+
         err = target_dist - dist
         u = dn * np.clip(err / dt, -SETTLE_SPEED, SETTLE_SPEED)
         settle_steps_done += 1
 
-        # RLS 更新（settle 阶段是主要激励窗口）
+        # RLS 更新（全程激励窗口）
         st  = max(0., dist - L0_est)
         vs  = np.linalg.norm(v_cur)
         ac  = np.linalg.norm((v_cur-v_prev)/dt)
@@ -423,7 +420,7 @@ for t in range(T_sim):
         f_lower, f_upper = rls.force_bounds(f_taut)
         f_upper = min(f_upper, f_max_safe)
 
-        # GPR 也开始积累数据（但还不接管控制）
+        # GPR 积累数据
         gpr.add_data(st, vs, theta_cur, fm)
         if len(gpr.X) >= 15 and t%5==0: gpr.fit()
 
@@ -453,19 +450,17 @@ for t in range(T_sim):
         if arc_steps % R_REF_UPDATE == 0:
             R_ref = 0.8 * R_ref + 0.2 * dist
 
-        # GPR 更新
+        # GPR 更新（只用于提供 σ 收紧约束）
         gpr.add_data(st, vs, theta_cur, fm)
         if t%15==0: gpr.fit()
-        mu, sr = gpr.predict(st, vs, theta_cur)
+        _, sr = gpr.predict(st, vs, theta_cur)
         if sr is None: sr=0.
-        mu_val = trls[0]*st if mu is None else mu
+        mu_val = trls[0]*st  # 显示用，用 RLS 线性估计
         sigma_s = 0.2*sr + 0.8*sigma_s
 
-        # GPR ready 条件：数据足够且已 fit
-        gpr_ready = gpr.fitted and (len(gpr.X) >= GPR_MIN_DATA)
         b_rls, m_rls = trls[1], trls[2]
 
-        # 动态速度上限：预热阶段极低速，之后线性爬升
+        # 动态速度上限
         if arc_steps < ARC_WARMUP_STEPS:
             v_max_cur = V_WARMUP
         else:
@@ -480,8 +475,7 @@ for t in range(T_sim):
                      theta_cur, theta_target,
                      f_taut, f_lower, f_upper,
                      sigma_gpr=sigma_s, v_max_cur=v_max_cur,
-                     R_ref=R_ref,
-                     gpr_model=gpr, gpr_ready=gpr_ready)
+                     R_ref=R_ref)
 
     hL0.append(L0_est); hphase.append(phase)
     v_prev=v_cur.copy(); v_cur=u.copy()
@@ -513,8 +507,8 @@ if arc_step is not None:
 # 绘图
 # ══════════════════════════════════════════════════════
 fig=plt.figure(figsize=(16,10))
-fig.suptitle("Integrated 3D Simulation  —  大纲四层架构 v9\n"
-             "三阶段: 探索→settle→弧线(MPC)  GPR主预测模型  ks=50",
+fig.suptitle("Integrated 3D Simulation  —  大纲四层架构 v11\n"
+             "三阶段: 探索→settle(拉伸扫描)→弧线  RLS驱动MPC  GPR仅提供σ  ks=50",
              fontsize=11, y=0.99)
 
 n=len(hf_a)
