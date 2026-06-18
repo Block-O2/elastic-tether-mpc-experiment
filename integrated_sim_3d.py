@@ -496,12 +496,13 @@ if arc_step is not None:
     viol=float(np.mean(fc>f_max_safe))*100
     print(f"\n[指标] 弧线阶段 RMS力误差={rms:.3f}N  超限={viol:.1f}%")
     print(f"[指标] 总步={len(hf_a)}  弧线步={len(fc)}")
-    pts2d=hp[arc_step:,:2]
-    xc,yc,R_fit=taubin_fit(pts2d)
-    if R_fit is not None:
-        print(f"[Taubin] 圆心({xc:.3f},{yc:.3f}) R={R_fit:.3f}m")
-    else:
-        print("[Taubin] 拟合失败")
+    # 新：已知圆心在锚点，直接算各点到锚点的距离
+    pts2d = hp[arc_step + ARC_WARMUP_STEPS:, :2]
+    dists = np.linalg.norm(pts2d - anchor_est[:2], axis=1)
+    R_fit = float(np.mean(dists))
+    R_std = float(np.std(dists))
+    xc, yc = anchor_est[0], anchor_est[1]
+    print(f"[半径估计] R_mean={R_fit:.3f}m  R_std={R_std:.4f}m  (锚点已知，直接测距)")
 
 # ══════════════════════════════════════════════════════
 # 绘图
@@ -529,7 +530,8 @@ if arc_step is not None:
     ax1.plot(*hp[arc_step,:2],'b^',ms=8,zorder=5,label=f'Arc start t={arc_step}')
 if R_fit is not None:
     tha=np.linspace(theta_start,theta_target,300)
-    ax1.plot(xc+R_fit*np.cos(tha),yc+R_fit*np.sin(tha),'m:',lw=1.5,label=f'Taubin R={R_fit:.2f}m')
+    ax1.plot(xc+R_fit*np.cos(tha), yc+R_fit*np.sin(tha), 'm:', lw=1.5,
+         label=f'R_mean={R_fit:.2f}m (±{R_std:.3f})')
 ax1.set_xlabel('x (m)'); ax1.set_ylabel('y (m)'); ax1.set_aspect('equal')
 ax1.legend(fontsize=7,loc='upper left'); ax1.set_title('Trajectory (top view)'); ax1.grid(True,alpha=0.3)
 
