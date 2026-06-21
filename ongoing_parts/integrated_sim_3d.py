@@ -71,11 +71,14 @@ settle→arc的转换需要同时满足：
   - anchor_est：锚点位置，实验开始前测量
   - noise_std_est：运行时从explore早期窗口标定，非真值
 
-ks_true、b_true、m_true、L0_true 只出现在"真实系统"代码块里
+force_model（材料模型对象）、L0_true 只出现在"真实系统"代码块里
 （仿真环境本身需要真值来生成数据），控制器逻辑全程不引用它们。
+force_model 可以是线性弹簧（LinearSpring）或非线性材料（见
+material_models.py）——控制器不知道、也不需要知道材料是哪一种。
 """
 import matplotlib
 matplotlib.use('Agg')
+import os
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.optimize import minimize
@@ -84,6 +87,14 @@ from sklearn.gaussian_process.kernels import RBF, WhiteKernel, ConstantKernel
 from scipy.stats import t as student_t
 import warnings
 warnings.filterwarnings('ignore')
+
+# 材料模型：line/硬化/迟滞/各向异性，统一通过 compute(...) 接口接入
+# run_sim。线性弹簧(LinearSpring)只是这套接口下最简单的一种特例，
+# 不再是 run_sim 内部写死的唯一选项。
+from material_models import (
+    LinearSpring, HardeningSpring, HysteresisSpring, PiecewiseAnisoSpring,
+    estimate_ks_max,
+)
 
 # 中文字体适配：按常见候选字体名依次尝试，找不到则静默回退到默认字体
 # （回退后中文会变成方块/丢字，但不会报错；建议本地环境装 Noto Sans CJK 或 SimHei）
@@ -455,27 +466,39 @@ def taubin_fit(pts):
 # ══════════════════════════════════════════════════════
 # 主仿真函数
 # ══════════════════════════════════════════════════════
-def run_sim(ks_true, arc_deg=90, STRETCH_MAX=0.25, f_max_safe=3.0,
-            w_time=None, b_true=0.5, m_true=0.05, L0_true=0.5,
-            noise_std=0.1, seed=42, verbose=True):
+def run_sim(force_model, arc_deg=90, STRETCH_MAX=0.25, f_max_safe=3.0,
+            w_time=None, L0_true=0.5, noise_std=0.1, seed=42, verbose=True):
     """
-    单次仿真入口：给定材料/任务/临床参数，跑完整的三阶段流程并返回结果。
+    单次仿真入口：给定材料模型/任务/临床参数，跑完整的三阶段流程并返回结果。
 
     这是 integrated_sim_3d.py 的核心仿真逻辑，被本文件末尾的"单次运行+
     画图"入口调用一次（默认参数），也被 run_experiment_matrix.py 调用
     多次（不同材料/任务组合）。两者共享同一份逻辑，不再各自维护一份
     可能逐渐不同步的副本。
 
+    材料通过 force_model 这个可插拔对象传入（见 material_models.py），
+    而不是裸的 ks_true 标量——这样线性弹簧只是众多材料模型里最简单的
+    一种特例（LinearSpring），渐进硬化/迟滞/各向异性等非线性材料用
+    同一个 run_sim 就能跑，不需要另外维护一份几乎重复的仿真逻辑。
+    所有材料模型实现统一接口：
+        force_model.compute(stretch, vel, acc, direction_angle=0.) -> 力大小
+
+    控制器逻辑（BOCD/RLS/GPR/MPC/距离约束）完全不知道、也不需要知道
+    传入的是哪种材料模型——这是这个设计的核心：如果架构合理，不应该
+    关心 true_force_3d 内部用的是哪种力学模型。
+
     参数
     ----
-    ks_true : float        材料真实刚度 (N/m)，控制器不可见，仅用于
-                            生成仿真观测（true_force_3d 内部使用）
+    force_model : 实现 compute(...) 接口的材料模型对象
+                  (LinearSpring / HardeningSpring / HysteresisSpring /
+                  PiecewiseAnisoSpring，见 material_models.py)
     arc_deg : float        目标弧线角度 (度)，默认90°
     STRETCH_MAX : float    临床输入：最大允许位移 (m)
     f_max_safe : float     临床输入：安全力阈值 (N)，仅作观测，不参与决策
     w_time : float|None    MPC 时间代价权重，None 时用模块级默认 W_TIME
-    b_true, m_true, L0_true, noise_std : float
-                            真实系统的其余参数，仅用于生成仿真观测
+    L0_true : float        材料自然长度 (m)，几何量，与材料力学行为无关，
+                            所有材料模型共用同一个真实自然长度
+    noise_std : float      传感器噪声标准差，仅用于生成仿真观测
     seed : int              随机种子
     verbose : bool          是否打印过程日志（实验矩阵批量跑时应设 False）
 
@@ -489,6 +512,8 @@ def run_sim(ks_true, arc_deg=90, STRETCH_MAX=0.25, f_max_safe=3.0,
         noise_std_est, R_fit, R_std, xc, yc
       - 实验指标：ks_settle, ks_final, rms, viol, dist_viol_upper,
         dist_viol_lower, total_steps, arc_steps_count
+        （ks_settle/ks_final 是 RLS 估计的等效线性刚度——线性材料下
+        逼近真实 ks；非线性材料下是个局部近似值，不对应单一真值）
     """
     np.random.seed(seed)
     anchor = np.array([0.0, 0.0, 0.0])
@@ -496,20 +521,21 @@ def run_sim(ks_true, arc_deg=90, STRETCH_MAX=0.25, f_max_safe=3.0,
         w_time = W_TIME
     arc_rad = np.radians(arc_deg)
 
-    # true_force_3d 定义在函数内部（而非模块级），依赖本次调用的真值
-    # 参数(ks_true, b_true, m_true, L0_true, anchor, noise_std)，
-    # 避免不同实验组之间因共享模块级变量而产生状态污染。
-    def true_force_mag(stretch, vel, acc):
-        if stretch <= 0:
-            return 0.0
-        return ks_true*stretch + b_true*vel + m_true*acc
-
+    # true_force_3d 定义在函数内部（而非模块级），依赖本次调用传入的
+    # force_model 和 noise_std，避免不同实验组之间因共享模块级变量而
+    # 产生状态污染。
+    #
+    # 力的大小完全由 force_model.compute(...) 决定，不再有写死的线性
+    # 公式。direction_angle 从 d=p-anchor 的方向角算出，传给各向异性
+    # 模型用（线性/硬化/迟滞模型会忽略这个参数，签名兼容但不使用）。
     def true_force_3d(p, vel=0.0, acc=0.0):
         d = p - anchor; dist = np.linalg.norm(d)
         noise = np.random.normal(0, noise_std, 3)
         if dist < 1e-6: return noise
         stretch = max(0.0, dist - L0_true)
-        f = max(0.0, true_force_mag(stretch, vel, acc))
+        direction_angle = np.arctan2(d[1], d[0])
+        f = max(0.0, force_model.compute(stretch, vel, acc,
+                                          direction_angle=direction_angle))
         if f < 1e-6: return noise
         return f * d/dist + noise
 
@@ -551,7 +577,7 @@ def run_sim(ks_true, arc_deg=90, STRETCH_MAX=0.25, f_max_safe=3.0,
     if verbose:
         print("Integrated 3D Simulation  —  大纲四层架构 v15")
     if verbose:
-        print(f"[真实系统(不可见)] ks_true={ks_true}  L0_true={L0_true}m")
+        print(f"[真实系统(不可见)] force_model={force_model!r}  L0_true={L0_true}m")
     if verbose:
         print(f"[临床输入] f_max_safe={f_max_safe}N  STRETCH_MAX={STRETCH_MAX}m")
     if verbose:
@@ -849,19 +875,20 @@ def run_sim(ks_true, arc_deg=90, STRETCH_MAX=0.25, f_max_safe=3.0,
     if arc_step is not None:
         fc   = hf_a[arc_step:]
         rms  = float(np.sqrt(np.mean((fc - f_taut) ** 2)))
-        # viol：之前用固定的 f_max_safe=3.0N 做阈值，这个数没有按材料
-        # 归一化——软材料(ks小)即使拉满 STRETCH_MAX 也到不了 3N，永远是
-        # 0%；硬材料(ks大)拉一点点就轻松超过，几乎总是 100%。这个指标
-        # 实际上只是在重复"ks 大小"这一个已知信息，没有任何诊断价值。
-        # 改为按材料归一化的参照阈值：f_static_max = 0.9 * STRETCH_MAX *
-        # ks_true，代表"材料被拉伸到 90% 允许范围时，纯静态(无速度/
-        # 加速度贡献)应产生的力"。实际力若超过这个值，说明出现了显著的
-        # 动态力分量(b*vel、m*acc，比如回归阶段的瞬时速度变化)，或者
-        # stretch 本身意外接近/超过 STRETCH_MAX——这才是真正反映"力控制
-        # 得好不好"的信号，而不是和某个绝对数字比大小。
-        # 注：ks_true 在这里是仿真生成数据用的真值，只用于事后诊断
-        # 指标计算，不进入任何控制器决策路径，不算真值泄露。
-        f_static_max = 0.9 * STRETCH_MAX * ks_true
+        # viol：归一化基准不能假设材料是线性弹簧——非线性材料(硬化/
+        # 迟滞/各向异性)没有单一的"真实刚度"常数，等效刚度随 stretch/
+        # vel/方向变化。改用 estimate_ks_max 采样估计这个材料模型在
+        # [0, STRETCH_MAX] 范围内实际可能产生的保守最大等效刚度，对
+        # 任何实现统一 compute 接口的材料模型都适用(线性模型也只是
+        # 这套接口下的一个特例，采样结果会精确收敛到其 ks 本身)，不
+        # 需要为每种模型单独推导解析公式。f_static_max 代表"材料被
+        # 拉伸到 90% 允许范围、按最不利方向/速度状态采样得到的参照
+        # 力"。实际力若超过这个值，说明出现了显著的动态力分量或
+        # stretch 意外超标——这才是真正反映"力控制得好不好"的信号。
+        # 注：force_model 在这里是仿真生成数据用的真值对象，只用于
+        # 事后诊断指标计算，不进入任何控制器决策路径，不算真值泄露。
+        ks_max_equiv = estimate_ks_max(force_model, STRETCH_MAX)
+        f_static_max = 0.9 * STRETCH_MAX * ks_max_equiv
         viol = float(np.mean(fc > f_static_max)) * 100
 
         # 距离约束违反统计
@@ -941,22 +968,43 @@ if __name__ == "__main__":
     # `from integrated_sim_3d import run_sim`）时不会执行，
     # 因此 import 这个模块是无副作用的。
     # ══════════════════════════════════════════════════════
+    # 材料模型选择
+    # ══════════════════════════════════════════════════════
+    # 编号 -> 模型实例的字典，而不是 if-else 链：加新材料只需要往字典
+    # 里加一行，不用碰选择逻辑本身；想看"2号是什么"也只需要看这张表，
+    # 不用去翻分支判断。改 MATERIAL_CHOICE 这一个数字就能切换材料。
+    MATERIAL_PRESETS = {
+        1: LinearSpring(ks=30, b=0.5, m=0.05),
+        2: HardeningSpring(ks_base=10, alpha=2.0, b=0.5, m=0.05),
+        3: HysteresisSpring(ks=20, hyst_gain=0.3, b=0.5, m=0.05),
+        4: PiecewiseAnisoSpring(ks_soft=8, ks_hard=40, STRETCH_MAX=0.25,
+                                 aniso_amp=0.2, b=0.5, m=0.05),
+        5: LinearSpring(ks=10, b=0.5, m=0.05),
+    }
+    MATERIAL_CHOICE = 4   # 改这个数字切换材料，对照 MATERIAL_PRESETS 表
+    # 注：4号(PiecewiseAnisoSpring)是已知未完全收敛的材料模型——分段
+    # 转折点附近刚度突变较大，RLS 单一局部线性假设难以跨越，settle
+    # 阶段常常超时退出而非真正收敛。这是当前架构的一个真实边界，不是
+    # bug，跑这个模型时建议同时看 verbose 日志里的 P比/err 是否真的
+    # 达标，不要只看 status='OK' 就认为收敛正常。
+
+    # ══════════════════════════════════════════════════════
     # 单次运行入口（默认参数）
     # ══════════════════════════════════════════════════════
     # run_experiment_matrix.py 会 import run_sim 并用不同参数多次调用，
     # 不会执行下面这部分；这部分只在直接运行本文件时触发一次。
-    _ks_true_run    = 10.0
+    _force_model    = MATERIAL_PRESETS[MATERIAL_CHOICE]
     _L0_true_run    = 0.5
     _STRETCH_MAX    = 0.25
     _f_max_safe     = 3.0
 
-    result = run_sim(ks_true=_ks_true_run, arc_deg=90,
+    result = run_sim(force_model=_force_model, arc_deg=90,
                       STRETCH_MAX=_STRETCH_MAX, f_max_safe=_f_max_safe,
                       L0_true=_L0_true_run, seed=42, verbose=True)
 
     # 把返回字典展开成画图代码使用的局部变量名
     anchor        = np.array([0.0, 0.0, 0.0])
-    ks_true       = _ks_true_run
+    force_model   = _force_model
     L0_true       = _L0_true_run
     STRETCH_MAX   = _STRETCH_MAX
     f_max_safe    = _f_max_safe
@@ -1071,11 +1119,16 @@ if __name__ == "__main__":
         ax4_r.legend(fontsize=7, loc='upper right')
         ax4.set_title('GPR σ + dynamic v_max'); ax4.grid(True, alpha=0.3)
 
-        # 5. RLS 刚度收敛
+        # 5. RLS 刚度收敛（force_model 可能是线性也可能是非线性材料，
+        # 没有统一保证存在的单一"真值"标量；用 estimate_ks_max 采样
+        # 估计的等效最大刚度做参考线——线性材料下精确等于 ks 本身，
+        # 非线性材料下是个量级参考，不是真值，标签里写清楚避免误读）
         ax5 = fig.add_subplot(2, 3, 5)
         ks_all = np.array(hks)
+        ks_max_equiv = estimate_ks_max(force_model, STRETCH_MAX)
         ax5.plot(ks_all, 'b-', lw=1.5, label='RLS ks estimate')
-        ax5.axhline(ks_true, color='r', ls='--', label=f'True ks={ks_true} (不可见)')
+        ax5.axhline(ks_max_equiv, color='r', ls='--',
+                    label=f'采样估计ks_max≈{ks_max_equiv:.1f} (量级参考，非真值)')
         ax5.axhline(PRED_ERR_MULT * noise_std_est, color='orange', ls=':', lw=1.2,
                     label=f'pred_err_thresh={PRED_ERR_MULT*noise_std_est:.2f}N (标定)')
         if taut_step is not None:
@@ -1103,6 +1156,7 @@ if __name__ == "__main__":
         ax6.legend(fontsize=7); ax6.set_title('Force estimate vs true'); ax6.grid(True, alpha=0.3)
 
         plt.tight_layout()
-        out = 'integrated_sim_3d_v15.png'
+        out = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            f'integrated_sim_3d_v15_{MATERIAL_CHOICE}.png')
         plt.savefig(out, dpi=150, bbox_inches='tight')
         print(f"\n[Plot] saved → {out}")

@@ -32,6 +32,7 @@ warnings.filterwarnings('ignore')
 # 直接复用 integrated_sim_3d.py 里的核心仿真逻辑，而不是重新实现一份
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from integrated_sim_3d import run_sim
+from material_models import LinearSpring
 
 # ══════════════════════════════════════════════════════
 # 实验矩阵参数
@@ -48,16 +49,25 @@ F_MAX_SAFE   = 3.0    # N，安全力阈值（仅作观测，不参与决策）
 # 不是和上面 F_MAX_SAFE 这个固定值比较——3N 这个绝对数字没有按材料
 # 归一化，软材料(ks小)永远到不了，硬材料(ks大)轻松超过，会让这个字段
 # 在不同 ks 组之间失去区分度，只是在重复"ks 大小"这个已知信息。
-# run_sim 内部用的是材料归一化后的参照阈值：
-#   f_static_max = 0.9 * STRETCH_MAX * ks_true
-# 代表"材料被拉伸到 90% 允许范围时，纯静态(无速度/加速度贡献)应产生
-# 的力"。viol 衡量的是实际力超过这个材料自身参照值的步数占比，能
-# 真实反映"力控制得好不好"，而不是和某个绝对数字比大小。
+# run_sim 内部用 estimate_ks_max(force_model, STRETCH_MAX) 采样估计
+# 材料的保守等效最大刚度，再算 f_static_max = 0.9 * STRETCH_MAX *
+# ks_max_equiv，代表"材料被拉伸到 90% 允许范围时应产生的参照力"。
+# viol 衡量的是实际力超过这个材料自身参照值的步数占比，能真实反映
+# "力控制得好不好"，而不是和某个绝对数字比大小。这套归一化对线性/
+# 非线性材料都适用（线性材料下采样结果精确收敛到 ks 本身）。
 
 
 def run_one(ks, arc_deg, w_time, seed=42):
-    """跑一组实验，提取关心的标量指标。"""
-    r = run_sim(ks_true=ks, arc_deg=arc_deg,
+    """跑一组实验，提取关心的标量指标。
+
+    run_sim 现在接受 force_model 对象而不是裸的 ks_true 标量，这里把
+    ks 包成 LinearSpring(ks=ks)——线性弹簧是 run_sim 支持的众多材料
+    模型里最简单的一种特例，这个矩阵脚本本身仍然只测线性材料（已经
+    过 24 组实验验证的稳定基线），扩展到非线性材料矩阵是后续单独的
+    工作，不在这次改动范围内。
+    """
+    model = LinearSpring(ks=ks, b=0.5, m=0.05)
+    r = run_sim(force_model=model, arc_deg=arc_deg,
                 STRETCH_MAX=STRETCH_MAX, f_max_safe=F_MAX_SAFE,
                 w_time=w_time, seed=seed, verbose=False)
 
@@ -128,12 +138,14 @@ if __name__ == "__main__":
               'dist_viol_upper', 'dist_viol_lower',
               'r_mean', 'r_std', 'total_steps', 'arc_steps']
 
-    with open('results_v3.csv', 'w', newline='') as f:
+    csv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             'results_v3.csv')
+    with open(csv_path, 'w', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=fields)
         writer.writeheader()
         writer.writerows(results)
 
-    print(f"\n结果已写入 results_v3.csv")
+    print(f"\n结果已写入 {csv_path}")
     print("=" * 70)
 
     # ══════════════════════════════════════════════════════
