@@ -1422,7 +1422,7 @@ if __name__ == "__main__":
                                  aniso_amp=0.2, b=0.5, m=0.05),
         5: LinearSpring(ks=10, b=0.5, m=0.05),
     }
-    MATERIAL_CHOICE = 1   # 改这个数字切换材料，对照 MATERIAL_PRESETS 表
+    MATERIAL_CHOICE = 5   # 改这个数字切换材料，对照 MATERIAL_PRESETS 表
     # 注：4号(PiecewiseAnisoSpring)是已知未完全收敛的材料模型——分段
     # 转折点附近刚度突变较大，RLS 单一局部线性假设难以跨越，settle
     # 阶段常常超时退出而非真正收敛。这是当前架构的一个真实边界，不是
@@ -1475,8 +1475,36 @@ if __name__ == "__main__":
         print("\n[警告] 仿真未能在 T_sim 步内完成绷直，跳过画图。")
     else:
         # ══════════════════════════════════════════════════════
-        # 绘图
+        # 动图：六子图统一时间戳动画
         # ══════════════════════════════════════════════════════
+        from matplotlib.animation import FuncAnimation, PillowWriter
+        from matplotlib.patches import Circle
+
+        n = len(hf_a)
+        # hp 比 hf_a 多一个元素（循环末尾 append），统一截到 n
+        hp_n      = np.array(hp[:n])
+        # hks/hgmu/hgsig 可能因 continue 分支而比 hf_a 短，用 nan 补齐
+        def _pad(lst, length, fill=0.0):
+            a = np.array(lst, dtype=float)
+            if len(a) < length:
+                a = np.concatenate([a, np.full(length - len(a), fill)])
+            return a[:length]
+        phase_arr = _pad(hphase, n, fill=hphase[-1] if hphase else 0)
+        dist_arr  = np.linalg.norm(hp_n - anchor_est, axis=1)
+        ks_all    = _pad(hks,  n, fill=hks[-1]  if hks  else 0.0)
+        ks_max_equiv = estimate_ks_max(force_model, STRETCH_MAX)
+
+        # arc phase 数据（预先构建，动画帧中按当前步截取）
+        has_rls = arc_step is not None and len(h_rls_pred) > 0
+        rls_arr = np.array(h_rls_pred) if has_rls else np.array([])
+        gpr_arr = np.array(h_gpr_anchor, dtype=float) if has_rls else np.array([])
+        arc_gmu   = np.array(hgmu[arc_step:])   if arc_step is not None else np.array([])
+        arc_gsig2 = np.array(hgsig[arc_step:])  if arc_step is not None else np.array([])
+
+        # 动画帧数：每 STRIDE 步渲染一帧，控制文件大小和速度
+        STRIDE = max(1, n // 300)   # 最多 ~300 帧
+        frames = list(range(0, n, STRIDE)) + [n - 1]
+
         fig = plt.figure(figsize=(16, 10))
         fig.suptitle(
             f"Integrated 3D Simulation  —  大纲四层架构 v15\n"
@@ -1484,121 +1512,219 @@ if __name__ == "__main__":
             f"f_max_safe={f_max_safe}N(安全网)  无真值泄露",
             fontsize=11, y=0.99)
 
-        n = len(hf_a)
-        phase_arr = np.array(hphase + [hphase[-1] if hphase else 0])
-
-        # 1. 轨迹
         ax1 = fig.add_subplot(2, 3, 1)
-        p0 = np.where(phase_arr == 0)[0]
-        p1 = np.where(phase_arr == 1)[0]
-        p2 = np.where(phase_arr == 2)[0]
-        if len(p0) > 0: ax1.plot(hp[p0, 0], hp[p0, 1], 'gray', lw=1.2, label='Phase0: explore', alpha=0.7)
-        if len(p1) > 0: ax1.plot(hp[p1, 0], hp[p1, 1], 'orange', lw=1.5, label='Phase1: settle', alpha=0.8)
-        if len(p2) > 0: ax1.plot(hp[p2, 0], hp[p2, 1], 'b-', lw=2, label='Phase2: arc (MPC)')
-        ax1.plot(*anchor[:2], 'k+', ms=12, mew=2, label='Anchor')
-        if taut_step is not None:
-            ax1.plot(*hp[taut_step, :2], 'go', ms=8, zorder=5, label=f'BOCD t={taut_step}')
-        if arc_step is not None:
-            ax1.plot(*hp[arc_step, :2], 'b^', ms=8, zorder=5, label=f'Arc start t={arc_step}')
-        if R_fit is not None:
-            tha = np.linspace(theta_start, theta_target, 300)
-            ax1.plot(xc + R_fit * np.cos(tha), yc + R_fit * np.sin(tha), 'm:', lw=1.5,
-                     label=f'R_mean={R_fit:.2f}m (±{R_std:.3f})')
-            # 距离约束带可视化
-            if dist_taut is not None:
-                for r_, c_, lab_ in [(dist_taut, 'green', f'dist_taut={dist_taut:.3f}m'),
-                                     (dist_taut + STRETCH_MAX, 'red', f'dist_upper={dist_taut+STRETCH_MAX:.3f}m')]:
-                    circle = plt.Circle(anchor_est[:2], r_, fill=False, color=c_, ls='--', lw=1.2, label=lab_)
-                    ax1.add_patch(circle)
-        ax1.set_xlabel('x (m)'); ax1.set_ylabel('y (m)'); ax1.set_aspect('equal')
-        ax1.legend(fontsize=6, loc='upper left'); ax1.set_title('Trajectory (top view)'); ax1.grid(True, alpha=0.3)
-
-        # 2. 力 + 距离约束带
         ax2 = fig.add_subplot(2, 3, 2)
-        ax2.plot(np.arange(n), hf_a, 'b-', lw=1.2, label='Force magnitude', alpha=0.85)
-        ax2.axhline(f_max_safe, color='red', ls='-', lw=1.5, label=f'f_max_safe={f_max_safe}N')
-        if taut_step is not None:
-            ax2.axvline(taut_step, color='green', ls='--', alpha=0.7, label=f'BOCD t={taut_step}')
-            ax2.axhline(f_taut, color='purple', ls='--', lw=1.2, label=f'f_taut={f_taut:.2f}N')
-        if arc_step is not None:
-            ax2.axvline(arc_step, color='blue', ls=':', alpha=0.7, label=f'Arc start t={arc_step}')
-        ax2.set_ylabel('Force (N)'); ax2.set_xlabel('Time step')
-        ax2.legend(fontsize=7); ax2.set_title('Force (距离约束→间接控制力)'); ax2.grid(True, alpha=0.3)
-
-        # 3. 距离演化 + 约束带（核心安全图）
         ax3 = fig.add_subplot(2, 3, 3)
-        dist_arr = np.linalg.norm(hp[:n] - anchor_est, axis=1)
-        ax3.plot(np.arange(n), dist_arr, 'b-', lw=1.5, label='dist(t) from anchor')
+        ax4 = fig.add_subplot(2, 3, 4)
+        ax5 = fig.add_subplot(2, 3, 5)
+        ax6 = fig.add_subplot(2, 3, 6)
+
+        # ── 初期一次性元素（不随时间变化的背景层） ──────────
+        # ax1: 约束圆和最终弧线拟合（背景）
+        if R_fit is not None and dist_taut is not None:
+            tha = np.linspace(theta_start, theta_target, 300)
+            ax1.plot(xc + R_fit * np.cos(tha), yc + R_fit * np.sin(tha),
+                     'm:', lw=1.5, label=f'R_mean={R_fit:.2f}m (±{R_std:.3f})', zorder=1)
+            for r_, c_, lab_ in [
+                (dist_taut,              'green', f'dist_taut={dist_taut:.3f}m'),
+                (dist_taut + STRETCH_MAX, 'red',  f'dist_upper={dist_taut+STRETCH_MAX:.3f}m'),
+            ]:
+                circ = Circle(anchor_est[:2], r_, fill=False, color=c_, ls='--', lw=1.2,
+                              label=lab_, zorder=2)
+                ax1.add_patch(circ)
+        ax1.plot(*anchor[:2], 'k+', ms=12, mew=2, label='Anchor', zorder=3)
+        if taut_step is not None:
+            ax1.plot(*hp_n[taut_step, :2], 'go', ms=8, zorder=5,
+                     label=f'BOCD t={taut_step}')
+        if arc_step is not None:
+            ax1.plot(*hp_n[arc_step, :2], 'b^', ms=8, zorder=5,
+                     label=f'Arc start t={arc_step}')
+        ax1.set_aspect('equal'); ax1.set_xlabel('x (m)'); ax1.set_ylabel('y (m)')
+        ax1.set_title('Trajectory (top view)'); ax1.grid(True, alpha=0.3)
+        ax1.legend(fontsize=6, loc='upper left')
+
+        # ax2/ax3 水平参考线
+        ax2.axhline(f_max_safe, color='red', ls='-', lw=1.5,
+                    label=f'f_max_safe={f_max_safe}N')
+        if taut_step is not None:
+            ax2.axvline(taut_step, color='green', ls='--', alpha=0.7,
+                        label=f'BOCD t={taut_step}')
+            ax2.axhline(f_taut, color='purple', ls='--', lw=1.2,
+                        label=f'f_taut={f_taut:.2f}N')
+        if arc_step is not None:
+            ax2.axvline(arc_step, color='blue', ls=':', alpha=0.7,
+                        label=f'Arc start t={arc_step}')
+        ax2.set_ylabel('Force (N)'); ax2.set_xlabel('Time step')
+        ax2.set_title('Force (距离约束→间接控制力)'); ax2.grid(True, alpha=0.3)
+        ax2.legend(fontsize=7)
+
         if dist_taut is not None:
-            ax3.axhline(dist_taut, color='green', ls='--', lw=1.5, label=f'dist_taut={dist_taut:.3f}m')
+            ax3.axhline(dist_taut, color='green', ls='--', lw=1.5,
+                        label=f'dist_taut={dist_taut:.3f}m')
             ax3.axhline(dist_taut + STRETCH_MAX, color='red', ls='--', lw=1.5,
                         label=f'dist_upper={dist_taut+STRETCH_MAX:.3f}m')
             ax3.fill_between(np.arange(n), dist_taut, dist_taut + STRETCH_MAX,
                              alpha=0.08, color='green', label='安全距离带')
-        ax3.axhline(L0_true, color='gray', ls=':', lw=1, label=f'True L0={L0_true}m (不可见)')
-        if taut_step is not None:
-            ax3.axvline(taut_step, color='green', ls='--', alpha=0.6)
-        if arc_step is not None:
-            ax3.axvline(arc_step, color='blue', ls=':', alpha=0.6)
+        ax3.axhline(L0_true, color='gray', ls=':', lw=1,
+                    label=f'True L0={L0_true}m (不可见)')
+        if taut_step is not None: ax3.axvline(taut_step, color='green', ls='--', alpha=0.6)
+        if arc_step  is not None: ax3.axvline(arc_step,  color='blue',  ls=':', alpha=0.6)
         ax3.set_ylabel('Distance (m)'); ax3.set_xlabel('Time step')
-        ax3.legend(fontsize=7); ax3.set_title('Distance + 约束带 (核心安全图)'); ax3.grid(True, alpha=0.3)
+        ax3.set_title('Distance + 约束带 (核心安全图)'); ax3.grid(True, alpha=0.3)
+        ax3.legend(fontsize=7)
 
-        # 4. 三线对比：真实力 vs GPR锚点力 vs RLS预测力（arc阶段）
-        ax4 = fig.add_subplot(2, 3, 4)
-        if arc_step is not None and len(h_rls_pred) > 0:
-            tc4 = np.arange(arc_step, arc_step + len(h_rls_pred))
-            true_arc = hf_a[arc_step: arc_step + len(h_rls_pred)]
-            rls_arr  = np.array(h_rls_pred)
-            gpr_arr  = np.array(h_gpr_anchor, dtype=float)
-            ax4.plot(tc4, true_arc, 'k-',  lw=1.2, alpha=0.7, label='True force')
-            ax4.plot(tc4, rls_arr,  'b--', lw=1.2, alpha=0.8, label='RLS predicted')
-            ax4.plot(tc4, gpr_arr,  'r-',  lw=1.5, alpha=0.9, label='GPR anchor (μ)')
-            ax4.axhline(f_taut, color='purple', ls=':', lw=1, label=f'f_taut={f_taut:.2f}N')
-            gpr_used_pct = np.sum(~np.isnan(gpr_arr)) / max(len(gpr_arr), 1) * 100
-            ax4.set_title(f'Force: True vs GPR vs RLS  (GPR采用率{gpr_used_pct:.0f}%)')
-        else:
-            ax4.set_title('Force: True vs GPR vs RLS (no arc data)')
-        ax4.set_ylabel('Force (N)'); ax4.set_xlabel('Time step')
-        ax4.legend(fontsize=7); ax4.grid(True, alpha=0.3)
-
-        # 5. RLS 刚度收敛（force_model 可能是线性也可能是非线性材料，
-        # 没有统一保证存在的单一"真值"标量；用 estimate_ks_max 采样
-        # 估计的等效最大刚度做参考线——线性材料下精确等于 ks 本身，
-        # 非线性材料下是个量级参考，不是真值，标签里写清楚避免误读）
-        ax5 = fig.add_subplot(2, 3, 5)
-        ks_all = np.array(hks)
-        ks_max_equiv = estimate_ks_max(force_model, STRETCH_MAX)
-        ax5.plot(ks_all, 'b-', lw=1.5, label='RLS ks estimate')
+        # ax5 参考线
         ax5.axhline(ks_max_equiv, color='r', ls='--',
-                    label=f'采样估计ks_max≈{ks_max_equiv:.1f} (量级参考，非真值)')
+                    label=f'采样估计ks_max≈{ks_max_equiv:.1f}')
         ax5.axhline(PRED_ERR_MULT * noise_std_est, color='orange', ls=':', lw=1.2,
-                    label=f'pred_err_thresh={PRED_ERR_MULT*noise_std_est:.2f}N (标定)')
-        if taut_step is not None:
-            ax5.axvline(taut_step, color='green', ls='--', alpha=0.6, label='BOCD')
-        if arc_step is not None:
-            ax5.axvline(arc_step, color='blue', ls=':', alpha=0.6, label='Arc start')
+                    label=f'pred_err_thresh={PRED_ERR_MULT*noise_std_est:.2f}N')
+        if taut_step is not None: ax5.axvline(taut_step, color='green', ls='--', alpha=0.6)
+        if arc_step  is not None: ax5.axvline(arc_step,  color='blue',  ls=':', alpha=0.6)
         ax5.set_ylabel('ks (N/m)'); ax5.set_xlabel('Time step')
-        ax5.legend(fontsize=7); ax5.set_title('Stiffness estimation (RLS)'); ax5.grid(True, alpha=0.3)
+        ax5.set_title('Stiffness estimation (RLS)'); ax5.grid(True, alpha=0.3)
+        ax5.legend(fontsize=7)
 
-        # 6. GPR 预测 vs 真实力
-        ax6 = fig.add_subplot(2, 3, 6)
+        # ax6 参考线
         if arc_step is not None:
-            arc_gmu  = np.array(hgmu[arc_step:])
-            arc_gsig2 = np.array(hgsig[arc_step:])
-            tc6 = np.arange(arc_step, arc_step + len(arc_gmu))
-            if len(arc_gmu) > 2:
-                ftc = hf_a[arc_step:arc_step + len(arc_gmu)]
-                ax6.plot(tc6, ftc, 'k-', alpha=0.6, lw=1, label='True force')
-                ax6.plot(tc6, arc_gmu, 'b-', lw=1.5, label='RLS est force (μ)')
-                ax6.fill_between(tc6, arc_gmu - 2 * arc_gsig2, arc_gmu + 2 * arc_gsig2,
-                                 alpha=0.25, color='blue', label='±2σ_GPR')
-                ax6.axhline(f_taut, color='purple', ls='--', label=f'f_taut={f_taut:.2f}N')
-                ax6.axhline(f_max_safe, color='red', ls='-', lw=1, label=f'f_max={f_max_safe}N')
+            ax6.axhline(f_taut,    color='purple', ls='--', label=f'f_taut={f_taut:.2f}N')
+            ax6.axhline(f_max_safe, color='red',   ls='-', lw=1, label=f'f_max={f_max_safe}N')
         ax6.set_ylabel('Force (N)'); ax6.set_xlabel('Time step')
-        ax6.legend(fontsize=7); ax6.set_title('Force estimate vs true'); ax6.grid(True, alpha=0.3)
+        ax6.set_title('Force estimate vs true'); ax6.grid(True, alpha=0.3)
+        ax6.legend(fontsize=7)
 
-        plt.tight_layout()
+        # 设置坐标轴范围（固定，避免动画过程中抖动）
+        x_all, y_all = hp_n[:, 0], hp_n[:, 1]
+        pad = 0.05
+        ax1.set_xlim(x_all.min() - pad, x_all.max() + pad)
+        ax1.set_ylim(y_all.min() - pad, y_all.max() + pad)
+        ax2.set_xlim(0, n); ax2.set_ylim(0, max(hf_a) * 1.15)
+        ax3.set_xlim(0, n)
+        d_min = min(dist_arr.min(), dist_taut * 0.9 if dist_taut else dist_arr.min())
+        d_max = max(dist_arr.max(), (dist_taut + STRETCH_MAX) * 1.05 if dist_taut else dist_arr.max())
+        ax3.set_ylim(d_min, d_max)
+        ax5.set_xlim(0, n); ax5.set_ylim(0, ks_all.max() * 1.2)
+
+        # arc 阶段子图范围
+        if has_rls and len(rls_arr) > 0:
+            all_f = np.concatenate([hf_a[arc_step:arc_step+len(rls_arr)], rls_arr,
+                                    gpr_arr[~np.isnan(gpr_arr)]])
+            ax4.set_xlim(arc_step, arc_step + len(rls_arr))
+            ax4.set_ylim(max(0, all_f.min() - 0.5), all_f.max() + 0.5)
+            ax4.axhline(f_taut, color='purple', ls=':', lw=1, label=f'f_taut={f_taut:.2f}N')
+            ax4.set_ylabel('Force (N)'); ax4.set_xlabel('Time step')
+            ax4.legend(fontsize=7); ax4.grid(True, alpha=0.3)
+        if arc_step is not None and len(arc_gmu) > 0:
+            all_g = np.concatenate([hf_a[arc_step:arc_step+len(arc_gmu)], arc_gmu])
+            ax6.set_xlim(arc_step, arc_step + len(arc_gmu))
+            ax6.set_ylim(max(0, all_g.min() - 0.5), all_g.max() + 0.5)
+
+        # ── 动态线对象（init_func 里初始化为空） ─────────────
+        # ax1: 轨迹按 phase 着色，用三段折线 + 当前 EE 点
+        ln1_p0, = ax1.plot([], [], 'gray', lw=1.2, alpha=0.7, zorder=2)
+        ln1_p1, = ax1.plot([], [], color='orange', lw=1.5, alpha=0.8, zorder=2)
+        ln1_p2, = ax1.plot([], [], 'b-', lw=2, zorder=2)
+        dot1,   = ax1.plot([], [], 'ro', ms=6, zorder=6)  # 当前 EE 位置
+
+        ln2,    = ax2.plot([], [], 'b-', lw=1.2, alpha=0.85)
+        vl2     = ax2.axvline(0, color='gray', ls='-', lw=0.8, alpha=0.5)
+
+        ln3,    = ax3.plot([], [], 'b-', lw=1.5)
+        vl3     = ax3.axvline(0, color='gray', ls='-', lw=0.8, alpha=0.5)
+
+        ln4_true, = ax4.plot([], [], 'k-',  lw=1.2, alpha=0.7, label='True force')
+        ln4_rls,  = ax4.plot([], [], 'b--', lw=1.2, alpha=0.8, label='RLS predicted')
+        ln4_gpr,  = ax4.plot([], [], 'r-',  lw=1.5, alpha=0.9, label='GPR anchor (μ)')
+        ax4.set_title('Force: True vs GPR vs RLS')
+
+        ln5,    = ax5.plot([], [], 'b-', lw=1.5, label='RLS ks estimate')
+
+        ln6_true, = ax6.plot([], [], 'k-',  alpha=0.6, lw=1,   label='True force')
+        ln6_mu,   = ax6.plot([], [], 'b-',  lw=1.5,            label='RLS est force (μ)')
+        fill6 = [None]  # 用列表包装，方便 closure 修改
+
+        # 时间戳文字
+        ts_text = fig.text(0.5, 0.965, '', ha='center', fontsize=10, color='dimgray')
+
+        plt.tight_layout(rect=[0, 0, 1, 0.955])
+
+        def init():
+            for ln in (ln1_p0, ln1_p1, ln1_p2, dot1,
+                       ln2, ln3, ln4_true, ln4_rls, ln4_gpr, ln5,
+                       ln6_true, ln6_mu):
+                ln.set_data([], [])
+            vl2.set_xdata([0]); vl3.set_xdata([0])
+            ts_text.set_text('')
+            return (ln1_p0, ln1_p1, ln1_p2, dot1, ln2, vl2, ln3, vl3,
+                    ln4_true, ln4_rls, ln4_gpr, ln5, ln6_true, ln6_mu, ts_text)
+
+        def update(t):
+            t = min(t, n - 1)
+            pa = phase_arr[:t+1]
+
+            # ax1 轨迹（只画到 t，用 hp_n 保证下标不越界）
+            idx0 = np.where(pa == 0)[0]; idx1 = np.where(pa == 1)[0]; idx2 = np.where(pa == 2)[0]
+            # 下标可能来自 np.where，需额外 clip 到 n-1
+            idx0 = idx0[idx0 < n]; idx1 = idx1[idx1 < n]; idx2 = idx2[idx2 < n]
+            ln1_p0.set_data(hp_n[idx0, 0] if len(idx0) else [],
+                            hp_n[idx0, 1] if len(idx0) else [])
+            ln1_p1.set_data(hp_n[idx1, 0] if len(idx1) else [],
+                            hp_n[idx1, 1] if len(idx1) else [])
+            ln1_p2.set_data(hp_n[idx2, 0] if len(idx2) else [],
+                            hp_n[idx2, 1] if len(idx2) else [])
+            dot1.set_data([hp_n[t, 0]], [hp_n[t, 1]])
+
+            # ax2 力
+            ln2.set_data(np.arange(t+1), hf_a[:t+1])
+            vl2.set_xdata([t])
+
+            # ax3 距离
+            ln3.set_data(np.arange(t+1), dist_arr[:t+1])
+            vl3.set_xdata([t])
+
+            # ax4 三线对比（只在 arc 阶段开始后有数据）
+            if has_rls and arc_step is not None and t >= arc_step:
+                i_end = min(t - arc_step + 1, len(rls_arr))
+                tc4 = np.arange(arc_step, arc_step + i_end)
+                ln4_true.set_data(tc4, hf_a[arc_step:arc_step+i_end])
+                ln4_rls.set_data(tc4, rls_arr[:i_end])
+                valid_gpr = gpr_arr[:i_end]
+                ln4_gpr.set_data(tc4, np.where(np.isnan(valid_gpr), np.nan, valid_gpr))
+                used = np.sum(~np.isnan(valid_gpr))
+                ax4.set_title(f'Force: True vs GPR vs RLS  (GPR采用率{used/max(i_end,1)*100:.0f}%)')
+
+            # ax5 刚度
+            ln5.set_data(np.arange(t+1), ks_all[:t+1])
+
+            # ax6 GPR ± 2σ（只在 arc 阶段）
+            if arc_step is not None and t >= arc_step and len(arc_gmu) > 0:
+                i_end6 = min(t - arc_step + 1, len(arc_gmu))
+                tc6 = np.arange(arc_step, arc_step + i_end6)
+                ln6_true.set_data(tc6, hf_a[arc_step:arc_step+i_end6])
+                ln6_mu.set_data(tc6, arc_gmu[:i_end6])
+                # fill_between 需要每帧重建
+                if fill6[0] is not None:
+                    fill6[0].remove()
+                fill6[0] = ax6.fill_between(
+                    tc6,
+                    arc_gmu[:i_end6] - 2 * arc_gsig2[:i_end6],
+                    arc_gmu[:i_end6] + 2 * arc_gsig2[:i_end6],
+                    alpha=0.25, color='blue')
+
+            # 时间戳
+            phase_name = {0: 'Explore', 1: 'Settle', 1.5: 'Tangential',
+                          1.6: 'Retract', 2: 'Arc'}
+            cur_phase = hphase[min(t, len(hphase)-1)]
+            pname = phase_name.get(cur_phase, f'Phase{cur_phase}')
+            ts_text.set_text(f't = {t:4d} / {n-1}   [{pname}]')
+
+            return (ln1_p0, ln1_p1, ln1_p2, dot1, ln2, vl2, ln3, vl3,
+                    ln4_true, ln4_rls, ln4_gpr, ln5, ln6_true, ln6_mu,
+                    ts_text)
+
+        ani = FuncAnimation(fig, update, frames=frames, init_func=init,
+                            interval=40, blit=False)
+
         out = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                            f'integrated_sim_3d_v15_{MATERIAL_CHOICE}.png')
-        plt.savefig(out, dpi=150, bbox_inches='tight')
-        print(f"\n[Plot] saved → {out}")
+                           f'integrated_sim_3d_v15_{MATERIAL_CHOICE}.gif')
+        ani.save(out, writer=PillowWriter(fps=25), dpi=100)
+        print(f"\n[Animation] saved → {out}")
