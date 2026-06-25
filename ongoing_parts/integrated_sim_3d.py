@@ -134,6 +134,10 @@ R_REF_UPDATE = 20
 # ── Arc 早期安全预热 ─────────────────────────────────────
 ARC_WARMUP_STEPS = 20
 V_WARMUP         = 0.02
+SIGMA_S_FLOOR    = 0.3   # arc 入口 sigma_s 下限：GPR 还没有切向运动数据，
+                          # 即使在当前径向位置置信度很高，对即将发生的弧线
+                          # 运动也缺乏信息。量级 ≈ sensor_noise_std × 3，
+                          # 和 Python sim 自然产生的 sigma_s ≈ 0.365 同一量级。
 
 # ── Explore 阶段参数 ─────────────────────────────────────
 V_EXPLORE        = 0.06   # 固定探索速度 (m/s)，保守值，与材料参数无关
@@ -1045,6 +1049,17 @@ def run_sim(force_model, arc_deg=90, STRETCH_MAX=0.25, f_max_safe=3.0,
             stretch_target = np.clip(stretch_target, 0., STRETCH_MAX * 0.9)
             R_ref = dist_taut + stretch_target
 
+            # sigma_s 重置：arc 阶段刚开始时 GPR 还没有切向运动数据，
+            # 即使在当前径向位置预测方差很低（训练数据恰好集中在附近），
+            # 对即将发生的弧线运动也缺乏信息。如果直接继承前一阶段的
+            # EMA（可能已被压到接近 0），MPC 距离约束过松，后续 sigma
+            # 波动时约束急剧跳变，导致径向振荡。
+            # 用 GPR 当前 raw sigma 和 SIGMA_S_FLOOR 取较大值作为初始值。
+            _st_init = max(0., dist_cur - dist_taut)
+            _, _sr_init = gpr.predict(_st_init, 0., theta_cur)
+            if _sr_init is None: _sr_init = 0.
+            sigma_s = max(_sr_init, SIGMA_S_FLOOR)
+
             if verbose:
                 print(f"  [径向收回→Arc] t={t:3d}: dist={dist_cur:.3f}m (dist_taut={dist_taut:.3f}m)")
             if verbose:
@@ -1407,7 +1422,7 @@ if __name__ == "__main__":
                                  aniso_amp=0.2, b=0.5, m=0.05),
         5: LinearSpring(ks=10, b=0.5, m=0.05),
     }
-    MATERIAL_CHOICE = 5   # 改这个数字切换材料，对照 MATERIAL_PRESETS 表
+    MATERIAL_CHOICE = 1   # 改这个数字切换材料，对照 MATERIAL_PRESETS 表
     # 注：4号(PiecewiseAnisoSpring)是已知未完全收敛的材料模型——分段
     # 转折点附近刚度突变较大，RLS 单一局部线性假设难以跨越，settle
     # 阶段常常超时退出而非真正收敛。这是当前架构的一个真实边界，不是
