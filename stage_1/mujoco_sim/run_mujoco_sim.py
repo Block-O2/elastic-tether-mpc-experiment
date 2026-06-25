@@ -59,7 +59,7 @@ from integrated_sim_3d import (
     SIGMA_S_FLOOR,
 )
 
-from elastic_env import ElasticTetherMJEnv   # same directory
+from stage_1.mujoco_sim.elastic_env import ElasticTetherMJEnv   # same directory
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -529,7 +529,7 @@ if __name__ == '__main__':
     Quick single-run test.
     Run from mujoco_sim/:  python run_mujoco_sim.py
     """
-    from elastic_env import ElasticTetherMJEnv, MATERIAL_PRESETS
+    from stage_1.mujoco_sim.elastic_env import ElasticTetherMJEnv, MATERIAL_PRESETS
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
